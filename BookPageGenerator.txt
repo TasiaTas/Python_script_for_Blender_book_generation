@@ -1,0 +1,393 @@
+import bpy
+import bmesh
+import os
+import re
+import math
+from mathutils import Vector, Matrix
+
+#clear console
+#os.system("cls");
+
+###########
+#VARIABLES#
+###########
+
+folder_path = r"YOUR PATH TO THE IMAGES";
+image_ext = ".png";
+plane_size = 1.0;
+page_loopcuts = 40; # Make sure its the same number as the template page
+displacement = 0.005; # How much displacement there is between pages (in stack)
+hook_scale_mult = 0.05; # How small the empty will be
+weight_gradient_sharpness = 5.0; #The bigger the number, the sharper it is (the other way around makes it smoother)
+weight_group_name = "Gradient";
+
+#############################
+#PROCEDURAL PAGES COLLECTION#
+#############################
+
+# Get collection if exists
+collection_name = "ProceduralBookPages";
+pages_collection = bpy.data.collections.get(collection_name);
+
+# Create if does not exist
+if not pages_collection:
+    pages_collection = bpy.data.collections.new(collection_name);
+    bpy.data.scene.collection.children.link(pages_collection);
+
+###########################
+#CREATE THE LIST OF IMAGES#
+###########################
+
+# Clear existing objects (only those selected)
+"""for obj in bpy.context.selected_objects:
+    bpy.data.objects.remove(obj, do_unlink=True);"""
+    
+# Clear existing object (those inside the procedural collection, no need to select)
+for obj in pages_collection.objects:
+    bpy.data.objects.remove(obj, do_unlink=True);
+    
+# Delete non images
+image_files = list()
+for img in os.listdir(folder_path):
+    if img.endswith(image_ext):
+        # Extract number inside the string of the file name
+        match = re.search(r'(\d+)',img);
+        if match:
+            number = int(match.group(1));
+            # Create the list with pairs number and string
+            image_files.append((number,img));
+
+# Get all images sorted by first in pair
+image_files.sort(key=lambda x: x[0]);
+
+# Invert order to create the correct stack order for book
+image_files.reverse();
+
+# Debug
+"""for name in image_files:
+    print("Img: ", name[1]);"""
+
+# Make sure we have an even number of images
+if len(image_files) % 2 != 0:
+    print("Warning: Odd number of images, last one will be ignored");
+    
+##################
+#LOOPCUT FUNCTION# special thanks to Prime007 (link: https://blender.stackexchange.com/questions/196367/how-to-use-loopcut-slide-operation-without-any-ui)
+##################
+
+def bmesh_loopcut_multiple(bm, face_list, direction_axis, num_cuts):
+    # Deselect all faces
+    for f in bm.faces:
+        f.select = False;
+    # Ensure lookup table is valid for direct inexing of faces by their indeces
+    bm.faces.ensure_lookup_table();
+    
+    # Select target faces
+    for f_idx in face_list:
+        bm.faces[f_idx].select = True;
+    
+    # Collect actual face objects from indices for further processing
+    selected_faces = [bm.faces[f_idx] for f_idx in face_list];
+    
+    # Collect verts coords in those faces
+    verts = [v for f in selected_faces for v in f.verts];
+    coords = [v.co for v in verts];
+    
+    # Get min and max along X axis (start and end between which we want the loopcuts)
+    min_co = min(coords, key=lambda v: v.x);
+    max_co = max(coords, key=lambda v: v.x);
+    
+    # Calculate cut positions between min and max by using linear interpolation
+    cut_positions = [
+        min_co.lerp(max_co, (i + 1) / (num_cuts + 1))
+        for i in range(num_cuts)
+    ];
+    
+    for cut_point in cut_positions:
+        # Select all faces again to make sure geometry is valid
+        for f in bm.faces:
+            f.select = True;
+        for e in bm.edges:
+            e.select = True;
+    
+        # Gather selected edges and faces to provide as geometry to bisect_plane
+        geom = [e for e in bm.edges if e.select] + [f for f in bm.faces if f.select];
+    
+        # Bisect the plane defined by:
+        #plane_co: cutting point in 3D space
+        #plane_no: direction normal to the cutting plane
+        #dist: distance tolerance to catch geometry near plane
+        bmesh.ops.bisect_plane(
+            bm,
+            geom=geom,
+            dist=0.0001,
+            plane_co=cut_point,
+            plane_no=direction_axis
+    );
+    
+###############################################
+#CREATE THE 3D PLANES WITH THE IMAGES APPLIED#
+###############################################
+
+# Find the template page for later data copy
+template_page = bpy.data.objects.get("Template_Page");
+if not template_page:
+    print("Template_Page name not found! Rename template to Template_Page");
+
+# Find the template hook for later data copy
+template_hook = bpy.data.objects.get("Template_Hook");
+if not template_hook:
+    print("Template_Hook name not found! Rename template to Template_Hook");
+
+# MAIN LOOP GENERATOR OF ASSETS FOR EACH PAGE 
+for i in range(0, len(image_files) - 1, 2): # Iterate in steps of 2 to pair front/back images
+    
+    #####################################
+    #PAGE CREATION AND IMAGE ASSOCIATION#
+    #####################################
+    
+    # Extract both images for 1 page
+    front_img_path = os.path.join(folder_path, image_files[i+1][1]);
+    back_img_path = os.path.join(folder_path, image_files[i][1]);
+    
+    front_img = bpy.data.images.load(front_img_path);
+    back_img = bpy.data.images.load(back_img_path);
+
+    # Create default material for each page
+    mat = bpy.data.materials.new(name=f"Mat_Page_{i//2+1}");
+    mat.use_nodes = True;
+    nodes = mat.node_tree.nodes;
+    links = mat.node_tree.links;
+
+    # Delete default node setup
+    for node in nodes:
+        nodes.remove(node);
+        
+    # Create our own node setup
+    output_node = nodes.new(type='ShaderNodeOutputMaterial');
+    geometry_node = nodes.new(type='ShaderNodeNewGeometry'); # For separating back face from front face
+    mix_shader = nodes.new(type='ShaderNodeMixShader');
+    emission_front = nodes.new(type='ShaderNodeEmission'); # Image shine without external lighting
+    emission_back = nodes.new(type='ShaderNodeEmission'); # Image shine without external lighting
+    front_tex = nodes.new(type='ShaderNodeTexImage');
+    back_tex = nodes.new(type='ShaderNodeTexImage');
+    
+    # Add texture coordinate and mapping nodes for flipping back image (if not, reading goes from right to left)
+    tex_coord = nodes.new(type='ShaderNodeTexCoord')
+    mapping_node = nodes.new(type='ShaderNodeMapping')
+
+    # Associate NodeTexImage to the image
+    front_tex.image = front_img;
+    back_tex.image = back_img;
+    
+    # Flip UV horizontally (scale X = -1)
+    mapping_node.inputs['Scale'].default_value[0] = -1  # X
+    mapping_node.inputs['Scale'].default_value[1] = 1   # Y
+    mapping_node.inputs['Scale'].default_value[2] = 1   # Z
+
+    # Unions between created nodes
+    links.new(front_tex.outputs['Color'], emission_front.inputs['Color']);
+    links.new(tex_coord.outputs['UV'], mapping_node.inputs['Vector'])
+    links.new(mapping_node.outputs['Vector'], back_tex.inputs['Vector'])
+    links.new(back_tex.outputs['Color'], emission_back.inputs['Color']);
+    links.new(geometry_node.outputs['Backfacing'], mix_shader.inputs['Fac']);
+    links.new(emission_front.outputs['Emission'], mix_shader.inputs[1]);
+    links.new(emission_back.outputs['Emission'], mix_shader.inputs[2]);
+    links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface']);
+
+    # Create plane and assign material
+    bpy.ops.mesh.primitive_plane_add(size=plane_size);
+    plane = bpy.context.active_object;
+    plane.name = f"Page_{i//2 + 1}";
+    plane.data.materials.append(mat);
+    
+    ###################
+    # Cut loops for each page by using mesh data of the obj (for further animation)
+    obj = bpy.context.active_object;
+    bpy.ops.object.mode_set(mode='EDIT');
+    mesh = obj.data;
+    bm = bmesh.from_edit_mesh(mesh);
+    face_cut = [0];  # list for face indices, we only have 1 so 0
+
+    # Call function to make evenly spaced loopcuts along X axis
+    bmesh_loopcut_multiple(bm, face_cut, Vector((1, 0, 0)), page_loopcuts);
+
+    # Update the mesh
+    bmesh.update_edit_mesh(mesh);
+    ###################
+
+    # Move page to put origin on left edge as pivot point
+    bpy.ops.mesh.select_all(action="SELECT");                        
+    bpy.ops.transform.translate(value=(plane_size/2,0,0)); # Divide /2 because center is at origin/0, so move only half the distance
+    
+    # Shade smooth for each page
+    for face in bm.faces:
+        face.smooth = True;
+    # Apply changes again
+    bmesh.update_edit_mesh(mesh);
+    
+    # Free usage of bmesh
+    bm.free();
+    
+    # EXIT EDIT MODE
+    bpy.ops.object.mode_set(mode="OBJECT");
+    
+    # Move pages to template position and displace in Z upwards for stacking
+    if template_page:
+        plane.location.xy = template_page.location.xy;
+        plane.location.z = template_page.location.z + (i//2)*displacement; #Gets on the template Z positon and (X,Y,Z) uses last page position (second index img) + new displacement
+    
+    #Rotation change so the bend modifier is applied correctly later on
+    plane.rotation_euler = [math.radians(90),0,0];
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=False);
+    plane.rotation_euler = [math.radians(-90),0,0];
+    
+    ###############################
+    #MOVE TO PROCEDURAL COLLECTION#
+    ###############################
+    
+    # Move plane to new collection (unlink from active one and link to new one)
+    for col in plane.users_collection:
+        col.objects.unlink(plane);
+        
+    pages_collection.objects.link(plane)
+       
+    ###############################
+    #HOOK GENERATION FOR EACH PAGE#
+    ###############################
+    
+    # Create the empty
+    bpy.ops.object.empty_add(type=template_hook.empty_display_type); # Creates the same type as the template_hook
+    hook = bpy.context.active_object;
+    hook.name = f"Hook_{i//2 + 1}";
+    
+    # Copy loc and rot from template hook, manually change the scale and parent to book spine
+    if template_hook:
+        hook.location.xy = template_hook.location.xy;
+        hook.location.z = template_hook.location.z + (i//2)*displacement;
+        hook.rotation_euler = template_hook.rotation_euler.copy();
+        
+        # Change scale an apply it so it resets to 1,1,1 (for problem avoidance)
+        hook.scale = hook.scale * hook_scale_mult;
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True);
+        
+        # Parent the hook to the spine of the book
+        spine_obj = bpy.data.objects.get("Spine");
+        if spine_obj:
+            hook.parent = spine_obj;
+            hook.matrix_parent_inverse = spine_obj.matrix_world.inverted(); #reverse the position moving to where the hook was (in case the cursor has moved from the parent object)
+   
+    ###############################
+    #MOVE TO PROCEDURAL COLLECTION#
+    ###############################
+    
+    # Move plane to new collection (unlink from active one and link to new one)
+    for col in hook.users_collection:
+        col.objects.unlink(hook);
+        
+    pages_collection.objects.link(hook)
+    
+    ##############
+    #WIEGHT PAINT#
+    ##############
+    
+    # Change active obj back to plane
+    bpy.context.view_layer.objects.active = plane
+    
+    #Create or get vertex group
+    if weight_group_name in plane.vertex_groups:
+        group = plane.vertex_groups[weight_group_name];
+    else:
+        group = plane.vertex_groups.new(name=weight_group_name);
+        
+    # Get X bounds
+    verts = plane.data.vertices;
+    x_coords = [v.co.x for v in verts];
+    min_x, max_x = min(x_coords), max(x_coords);
+    span = max_x - min_x if max_x != min_x else 1.0; # Avoid div by 0
+    
+    # Assign weights
+    for v in verts:
+        x = v.co.x;
+        t = (x - min_x) / span; # Normalize between 0 and 1
+        weight = (1.0 - t) ** weight_gradient_sharpness; # Stronger on left
+        group.add([v.index],weight, "REPLACE");
+    
+    ################################
+    #MODIFIERS COPY FROM TEMPLATE#
+    ################################
+    
+    # Transfer the info to procedural page
+    if not template_page:
+        print("Can't transfer data if Page_Template name not found!");
+    else:
+        
+        # Create same types of modifiers as in template
+        for m in template_page.modifiers:
+            new_m = plane.modifiers.new(name=m.name, type=m.type);
+            new_m.name = m.name;
+            
+            # Generate the attributes one by one
+            for attr in dir(m):
+                
+                # Skip the internal ones so we don't touch them
+                if attr.startswith("_") or attr in {'bl_rna', 'rna_type', 'is_valid', 'name', 'type'}:
+                    continue;
+                
+                try:
+                    
+                    #get the attribute
+                    value = getattr(m, attr);
+                    
+                    # Setting for HOOK
+                    if m.type == "HOOK":
+                    
+                        # Setting the empty reference (hook)
+                        if attr == "object":
+                            setattr(new_m, attr, hook);
+                    
+                        # Setting the vertex group (wheight)
+                        elif attr == "vertex_group":
+                            setattr(new_m, attr, plane.vertex_groups[0].name);
+                    
+                    elif m.type == "SIMPLE_DEFORM":
+                        
+                        # Cahnge mode to bend
+                        if attr == "deform_method":
+                            setattr(new_m, attr, value);
+                        
+                        # Change axis of deformation to Z
+                        elif attr =="deform_axis":
+                            setattr(new_m, attr, value);
+                    
+                    # Everything else as default but we copy it
+                    else:
+                        setattr(new_mod, attr, value);
+                
+                # Manage exceptions (we skip them)
+                except Exception as e:
+                    continue;
+    
+    ###########
+    #ANIMATION#
+    ###########
+    originalHookPos = hook.location.xyz;
+    mod = plane.modifiers.get("SimpleDeform");
+    
+    if mod and mod.type == 'SIMPLE_DEFORM':
+        # Set angle back to 0 at frame 30
+        bpy.context.scene.frame_set(30);
+        mod.angle = 0;
+        mod.keyframe_insert(data_path="angle", frame=30);
+        
+    if mod and mod.type == 'SIMPLE_DEFORM':
+        # Set angle to -45 degrees (in radians) at frame 15
+        bpy.context.scene.frame_set(15);
+        mod.angle = -45 * (3.14159265 / 180);  # Convert degrees to radians
+        mod.keyframe_insert(data_path="angle", frame=15);
+    
+    if mod and mod.type == 'SIMPLE_DEFORM':
+        # Set angle to 0 at frame 0
+        bpy.context.scene.frame_set(0);
+        mod.angle = 0;
+        mod.keyframe_insert(data_path="angle", frame=0);
