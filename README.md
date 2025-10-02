@@ -2,4 +2,4 @@ This code let's you create pages of a book procedurally by accessing a folder wi
 
 This is an alpha version which I want to develop into a free Blender addon. Use it at your own discretion as it may not work exactly as you expect it to (especially the animation generation).
 
-You can watch the result I got from this here: [https://youtu.be/eZeUQKJiGTk]([https://example.com](https://youtu.be/eZeUQKJiGTk))
+You can watch the result I got from this here: [https://youtu.be/eZeUQKJiGTk](https://youtu.be/eZeUQKJiGTk)
